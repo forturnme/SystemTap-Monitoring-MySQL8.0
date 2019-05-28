@@ -1,0 +1,145 @@
+#!/usr/bin/stap
+# 统计的是mysqld在执行查询期间使用的CPU时间和文件读取次数、内存使用和变动（驻留集大小、总大小）
+# 执行说明：你应该在语句已经打好在mysql-cli，只差回车时开始执行此脚本
+global starttime, accumulate, walked, slic
+global filpr, fret, fcnt, rcnt, rsize
+global rss_p, rss_n, rss_min, rss_max # 前一个，后一个，最小，最大
+global mem_p, mem_n, mem_min, mem_max, pgsize
+global cache_bytes, cache_reqs, free_reqs
+
+# 从struct file*返回文件名
+# 由于这个版本的stap不能接受C语言传参，故用全局变量传参
+function FILENAME()
+%{
+  /* pragma:read:filpr */
+  /* pragma:write:fret */
+  STAP_GLOBAL_SET_fret((((struct file*)STAP_GLOBAL_GET_filpr())->f_path.dentry->d_iname));
+%}
+
+probe begin {
+  printf("开始跟踪mysqld的CPU时间和切出情况...\n")
+  walked = 0
+  fcnt = 0
+  pgsize = mem_page_size()
+}
+
+probe vfs.read {
+  # 给出文件名和读取长度
+  # mysqld使用的pread不便追踪文件名，故使用这个
+  if(execname()=="mysqld") {
+	  filpr = $file
+	  fcnt += 1
+    FILENAME()
+    rcnt[fret] += 1
+    rsize += $count
+    # 实时打印读取状况，不用可以注释掉
+    #printf("[READ]%s\t读取长度: %d B\n", fret, $count)
+  }
+}
+
+probe tty.write {
+  # 第一次写tty，表示收到指令，开始计时
+  # 第二次写tty，表示查询执行完毕，结束计时
+  if(execname()=="mysql"){
+    if(walked == 0){
+      printf("查询开始\n")
+      walked = 1
+      rsize = 0
+      cache_bytes = cache_reqs = free_reqs = 0
+    }
+    else if(walked == 1) {
+      walked = 2
+      exit()
+    }
+  }
+}
+
+probe vm.kmem_cache_alloc {
+  # 检测缓存区申请
+  if(execname()=="mysqld" && walked == 1) {
+    cache_bytes += bytes_alloc
+    cache_reqs += 1
+  }
+}
+
+probe vm.kmem_cache_free {
+  # 检测缓存区释放
+  if(execname()=="mysqld" && walked == 1) {
+    free_reqs += 1
+  }
+}
+
+probe scheduler.cpu_on {
+  # mysqld完成CPU接管开始执行
+  if(execname()=="mysqld" && walked == 1) {
+    starttime[cpu()] = gettimeofday_us()
+  }
+}
+
+probe scheduler.cpu_off {
+  # mysqld时间片用完离开CPU
+  if(walked == 1 && execname()=="mysqld" && starttime[cpu()] != 0){
+    accumulate[cpu()] += gettimeofday_us() - starttime[cpu()]
+    starttime[cpu()] = 0
+    slic[cpu()] += 1
+    
+    # 更新内存参数
+    if(mem_max == 0) {
+      mem_max = mem_min = proc_mem_size()
+      rss_max = rss_min = proc_mem_rss()
+    }
+    rss_n = proc_mem_rss()
+    mem_n = proc_mem_size()
+    # 实时打印内存变化，不用可以注释掉
+    #if(rss_p != 0 && rss_n - rss_p != 0) printf("[RSS_DELTA]%d KB\n", (rss_n-rss_p)*pgsize/1024)
+    # 实时打印内存变化，不用可以注释掉
+    #if(mem_p != 0 && mem_n - mem_p != 0) printf("[MEM_DELTA]%d KB\n", (mem_n-mem_p)*pgsize/1024)
+    if(rss_n > rss_max)rss_max = rss_n
+    if(rss_n < rss_min)rss_min = rss_n
+    if(mem_n > mem_max)mem_max = mem_n
+    if(mem_n < mem_min)mem_min = mem_n
+    rss_p = rss_n
+    mem_p = mem_n
+  }
+}
+
+probe end {
+  # 给出总体的统计
+  printf("\n<CPU使用情况>\n查询过程中，mysqld消耗各个cpu时间累计（系统时钟+用户时钟）：\n")
+  printf("CPUid\t时间/ms\t\t时间片数\n")
+  foreach(cup in accumulate) {
+    printf("%d\t%d.%d\t%d\n", cup, accumulate[cup]/1000, accumulate[cup]%1000, slic[cup])
+  }
+  printf("\n<文件读取情况统计>\n发生读取操作：%d次，总共读取大小%d.%dKB\n", fcnt, rsize/1024, rsize%1024)
+  # 给出文件分别的读取次数
+  printf("文件名\t\t读取次数\n")
+  foreach(addr in rcnt) {
+    printf("%s\t%d\n", addr, rcnt[addr])
+  }
+  print("\n<内存使用情况概要>\n")
+  print("物理内存（驻留集）:\n")
+  printf("最大：%d.%dKB，最小：%d.%dKB\n", rss_max*pgsize/1024, rss_max*pgsize%1024, rss_min*pgsize/1024, rss_min*pgsize%1024)
+  print("虚拟内存（全部分页）:\n")
+  printf("最大：%d.%dKB，最小：%d.%dKB\n", mem_max*pgsize/1024, mem_max*pgsize%1024, mem_min*pgsize/1024, mem_min*pgsize%1024)
+  printf("缓存区申请次数：%d，总申请大小：%d.%dKB，释放次数：%d\n\n", cache_reqs, cache_bytes/1024, cache_bytes%1024, free_reqs)
+  delete cache_reqs
+  delete cache_bytes
+  delete free_reqs
+  delete rsize
+  delete starttime
+  delete accumulate
+  delete walked
+  delete filpr
+  delete fcnt
+  delete rcnt
+  delete rss_p
+  delete rss_n
+  delete rss_min
+  delete rss_max
+  delete mem_p
+  delete mem_n
+  delete mem_min
+  delete mem_max
+  delete pgsize
+}
+
