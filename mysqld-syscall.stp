@@ -1,0 +1,44 @@
+#!/usr/bin/stap
+# 统计mysqld查询时使用的syscall和vfs
+# 执行说明：你应该在语句已经打好在mysql-cli，只差回车时开始执行此脚本
+# 由于此脚本探针数量多达422个，显示开始运行后建议等待10秒再开始查询，让所有探针能够生效
+global funcs, walked
+
+probe begin {
+  print("跟踪mysql系统调用使用状况...\n")
+  walked = 0
+}
+
+probe tty.write {
+  # 第一次写tty，表示收到指令
+  # 第二次写tty，表示查询执行完毕
+  if(execname()=="mysql"){
+    if(walked == 0){
+      printf("查询开始\n")
+      walked = 1
+    }
+    else if(walked == 1) {
+      walked = 2
+      exit()
+    }
+  }
+}
+
+probe syscall.*.call {
+  # 统计系统调用的使用情况
+  if(execname()=="mysqld" && walked==1) {
+    funcs[name] += 1
+  }
+}
+
+probe end {
+  # 给出系统调用统计
+  printf("\n<统计>\n%20s  \t使用次数\n", "调用名")
+  foreach(cs in funcs) {
+    printf("%20s  %d\n", cs, funcs[cs])
+  }
+  delete walked
+  delete funcs
+}
+
+
